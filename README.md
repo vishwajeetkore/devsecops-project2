@@ -2790,3 +2790,4 @@ Below are authoritative links and documentation used throughout this lecture:
 * Deployments: [https://kubernetes.io/docs/concepts/workloads/controllers/deployment/](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
 
 ---
+# devsecops-project2
