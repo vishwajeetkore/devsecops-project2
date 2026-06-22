@@ -1,0 +1,281 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'maven'
+    }
+
+    // ─── ENVIRONMENT ──────────────────────────────────────────────────────────
+    environment {
+        // --- SonarQube ---
+        // Use Jenkins-managed SonarQube server instead of hardcoding an IP.
+        // Configure under: Manage Jenkins → Configure System → SonarQube Servers
+        SONAR_PROJECT_KEY = 'devsecops-project2'
+
+        // --- ECR / Docker ---
+        AWS_REGION       = 'us-east-1'
+        ECR_REGISTRY     = '907260787494.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_REPOSITORY   = 'devsecops_project'
+        IMAGE_REPO       = "${ECR_REGISTRY}/${ECR_REPOSITORY}"
+        // BUILD_NUMBER gives a unique, traceable tag — never use 'latest' as the
+        // primary deploy tag in production (not reproducible / rollback-unsafe).
+        IMAGE_TAG        = "${BUILD_NUMBER}"
+
+        // --- Kubernetes ---
+        K8S_DEPLOYMENT   = 'devsecops-demo'
+        K8S_NAMESPACE    = 'production'          // always target an explicit namespace
+        K8S_MANIFEST     = 'deploy-svc.yaml'
+
+        // --- Trivy cache — scoped to workspace so parallel builds don't collide ---
+        TRIVY_CACHE_DIR  = "${WORKSPACE}/.trivycache"
+        TMPDIR           = "${WORKSPACE}/.trivytmp"
+    }
+
+    options {
+        // Abort the whole build if it hangs beyond 30 min
+        timeout(time: 30, unit: 'MINUTES')
+        // Keep only the last 10 builds to save disk space
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // Prevent overlapping deploys to the same environment
+        disableConcurrentBuilds()
+        // Timestamps in every log line — essential for post-incident debugging
+        timestamps()
+        // Add ANSI colour support (requires "AnsiColor" plugin)
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ── 1. SOURCE ────────────────────────────────────────────────────────
+        stage('Git Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/vishwajeetkore/devsecops-project2.git'
+                // Capture the exact commit SHA — attached to image label later
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        // ── 2. FILESYSTEM SECURITY SCAN ──────────────────────────────────────
+        // Scan source + dependencies BEFORE compiling — catch secrets & misconfigs
+        // early so you don't waste build time on poisoned code.
+        // exit-code 0 here: fail via a Quality Gate threshold, not a hard stop,
+        // so you still get the full Sonar report in step 3.
+        // Change to exit-code 1 once your baseline is clean.
+        stage('Trivy FS Scan') {
+            steps {
+                sh '''
+                    mkdir -p "$TRIVY_CACHE_DIR" "$TMPDIR"
+                    trivy fs \
+                      --exit-code 0 \
+                      --severity HIGH,CRITICAL \
+                      --format table \
+                      --output trivy-fs-report.txt \
+                      .
+                    cat trivy-fs-report.txt
+                '''
+            }
+            post {
+                always {
+                    // Archive the report regardless of pass/fail
+                    archiveArtifacts artifacts: 'trivy-fs-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 3. BUILD + SONAR SCAN ────────────────────────────────────────────
+        // withSonarQubeEnv injects SONAR_HOST_URL + SONAR_AUTH_TOKEN automatically
+        // from the Jenkins SonarQube server config — no hardcoded IPs or tokens.
+        stage('Build & Sonar Scan') {
+            steps {
+                withSonarQubeEnv('SonarQube') {          // name matches Jenkins config
+                    sh """
+                        mvn clean verify sonar:sonar \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.qualitygate.wait=true \
+                          -Dsonar.qualitygate.timeout=300
+                    """
+                }
+            }
+        }
+
+        // ── 4. SONAR QUALITY GATE ────────────────────────────────────────────
+        // Separate stage so the gate result is clearly visible in the pipeline view.
+        // waitForQualityGate polls SonarQube's webhook — faster than polling.
+        stage('Sonar Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ── 5. ECR LOGIN ─────────────────────────────────────────────────────
+        // Use Jenkins AWS credentials binding — never bake keys into the pipeline.
+        // Requires "Amazon ECR" + "AWS Credentials" plugins.
+        stage('Login to ECR') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'         // Jenkins credential ID
+                ]]) {
+                    sh '''
+                        aws ecr get-login-password --region "$AWS_REGION" | \
+                        docker login --username AWS --password-stdin "$ECR_REGISTRY"
+                    '''
+                }
+            }
+        }
+
+        // ── 6. DOCKER BUILD ───────────────────────────────────────────────────
+        // Tag with BUILD_NUMBER (immutable) AND git SHA (traceable).
+        // 'latest' is pushed as a convenience pointer — never deployed directly.
+        // --label embeds provenance metadata for future auditing.
+        stage('Docker Build') {
+            steps {
+                sh """
+                    docker build \
+                      --platform linux/amd64 \
+                      --label "git-commit=${GIT_COMMIT_SHORT}" \
+                      --label "build-number=${BUILD_NUMBER}" \
+                      --label "build-url=${BUILD_URL}" \
+                      -t "${IMAGE_REPO}:${IMAGE_TAG}" \
+                      -t "${IMAGE_REPO}:${GIT_COMMIT_SHORT}" \
+                      -t "${IMAGE_REPO}:latest" \
+                      .
+                """
+            }
+        }
+
+        // ── 7. IMAGE SECURITY SCAN ────────────────────────────────────────────
+        // Scan the built image before it ever touches ECR.
+        // exit-code 1 = hard-fail on CRITICAL in production builds.
+        // Adjust --severity based on your org's policy.
+        stage('Trivy Image Scan') {
+            steps {
+                sh '''
+                    mkdir -p "$TRIVY_CACHE_DIR" "$TMPDIR"
+                    trivy image \
+                      --image-src docker \
+                      --exit-code 1 \
+                      --severity CRITICAL \
+                      --format table \
+                      --output trivy-image-report.txt \
+                      "$IMAGE_REPO:$IMAGE_TAG"
+                    cat trivy-image-report.txt
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-image-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 8. PUSH TO ECR ────────────────────────────────────────────────────
+        // Push the build-number tag first — if the 'latest' push fails the
+        // immutable tag is already in ECR and can still be deployed.
+        stage('Docker Push') {
+            steps {
+                sh '''
+                    docker push "$IMAGE_REPO:$IMAGE_TAG"
+                    docker push "$IMAGE_REPO:$GIT_COMMIT_SHORT"
+                    docker push "$IMAGE_REPO:latest"
+                '''
+            }
+        }
+
+        // ── 9. MANIFEST UPDATE ────────────────────────────────────────────────
+        // sed the exact image line so other manifest fields are never touched.
+        // Printing the diff lets you verify the substitution in the build log.
+        stage('Update Deployment Manifest') {
+            steps {
+                sh '''
+                    cp "$K8S_MANIFEST" "${K8S_MANIFEST}.bak"
+                    sed -i "s|image:.*|image: $IMAGE_REPO:$IMAGE_TAG|g" "$K8S_MANIFEST"
+                    echo "--- Manifest diff ---"
+                    diff "${K8S_MANIFEST}.bak" "$K8S_MANIFEST" || true
+                    cat "$K8S_MANIFEST"
+                '''
+            }
+        }
+
+        // ── 10. DEPLOY ────────────────────────────────────────────────────────
+        // --namespace is explicit — avoids accidental deploys to 'default'.
+        // rollout status with 120 s timeout; auto-rollback on failure.
+        // kubectl apply is idempotent — safe to re-run.
+        stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                        kubectl apply -f "$K8S_MANIFEST" --namespace "$K8S_NAMESPACE"
+                        kubectl rollout status deployment/"$K8S_DEPLOYMENT" \
+                          --namespace "$K8S_NAMESPACE" \
+                          --timeout=120s || {
+                            echo "❌ Rollout failed — initiating rollback"
+                            kubectl rollout undo deployment/"$K8S_DEPLOYMENT" \
+                              --namespace "$K8S_NAMESPACE" || true
+                            exit 1
+                        }
+                        echo "✅ Deployment successful: $IMAGE_REPO:$IMAGE_TAG"
+                    '''
+                }
+            }
+        }
+
+        // ── 11. SMOKE TEST (optional but recommended) ─────────────────────────
+        // Hit the service's /health endpoint after deploy — catch runtime failures
+        // that Kubernetes itself won't surface (e.g., 500s, wrong env config).
+        stage('Smoke Test') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                        SVC_URL=$(kubectl get svc devsecops-demo-svc \
+                          --namespace "$K8S_NAMESPACE" \
+                          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+                        echo "Service URL: $SVC_URL"
+                        for i in 1 2 3 4 5; do
+                            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                              http://"$SVC_URL"/health || true)
+                            [ "$STATUS" = "200" ] && { echo "✅ Smoke test passed"; exit 0; }
+                            echo "Attempt $i: got HTTP $STATUS — retrying in 10s..."
+                            sleep 10
+                        done
+                        echo "❌ Smoke test failed after 5 attempts"
+                        exit 1
+                    '''
+                }
+            }
+        }
+    }
+
+    // ─── POST ACTIONS ─────────────────────────────────────────────────────────
+    post {
+        always {
+            // Clean local Docker images — Jenkins agent disk fills up fast otherwise
+            sh '''
+                docker rmi "$IMAGE_REPO:$IMAGE_TAG"    || true
+                docker rmi "$IMAGE_REPO:$GIT_COMMIT_SHORT" || true
+                docker rmi "$IMAGE_REPO:latest"        || true
+            '''
+            // Remove the kubeconfig temp file if it was written anywhere
+            cleanWs(cleanWhenAborted: true, cleanWhenFailure: true, cleanWhenSuccess: true)
+        }
+        success {
+            echo "🎉 Pipeline #${BUILD_NUMBER} succeeded — image: ${IMAGE_REPO}:${IMAGE_TAG}"
+            // Uncomment and configure to send Slack/email notifications:
+            // slackSend channel: '#deployments', color: 'good',
+            //   message: "✅ Build #${BUILD_NUMBER} deployed ${IMAGE_REPO}:${IMAGE_TAG}"
+        }
+        failure {
+            echo "💥 Pipeline #${BUILD_NUMBER} failed — check logs at ${BUILD_URL}"
+            // slackSend channel: '#deployments', color: 'danger',
+            //   message: "❌ Build #${BUILD_NUMBER} FAILED — ${BUILD_URL}"
+        }
+    }
+}
